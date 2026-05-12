@@ -1,5 +1,6 @@
 use process_mcp::mcp::server::ProcessServer;
 use process_mcp::mcp::tools::pids_in_cgroup::PidsInCgroupParams;
+use process_mcp::mcp::tools::top_processes::TopProcessesParams;
 use rmcp::handler::server::wrapper::Parameters;
 use std::fs;
 use std::path::PathBuf;
@@ -304,4 +305,285 @@ async fn pids_in_cgroup_ignores_non_numeric_proc_entries() {
     // be counted as skipped.
     assert_eq!(resp.results.len(), 1);
     assert_eq!(resp.skipped, 0);
+}
+
+// ---- top_processes ----
+
+fn make_proc(comm: &'static str, rss_kb: Option<u64>, cgroup: &'static str) -> ProcSpec {
+    ProcSpec {
+        comm,
+        cmdline: vec![comm],
+        state: 'S',
+        ppid: 1,
+        rss_kb,
+        cgroup,
+    }
+}
+
+#[tokio::test]
+async fn top_processes_returns_top_n_by_rss_desc() {
+    let dir = synthetic_proc_tree(&[
+        (10, make_proc("small", Some(1_024), "user.slice")),
+        (
+            11,
+            make_proc("huge", Some(500_000), "system.slice/big.service"),
+        ),
+        (
+            12,
+            make_proc("medium", Some(50_000), "system.slice/mid.service"),
+        ),
+        (13, make_proc("tiny", Some(64), "system.slice/tiny.service")),
+    ]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: Some(3),
+            cgroup_prefix: None,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+
+    let comms: Vec<&str> = resp.results.iter().map(|p| p.comm.as_str()).collect();
+    assert_eq!(comms, vec!["huge", "medium", "small"]);
+    assert_eq!(resp.results.len(), 3);
+    assert!(resp.cgroup_prefix.is_none());
+}
+
+#[tokio::test]
+async fn top_processes_n_defaults_to_10() {
+    // Build 12 processes; default n=10 should cap to 10.
+    let entries: Vec<_> = (1..=12u32)
+        .map(|i| {
+            (
+                100 + i,
+                ProcSpec {
+                    comm: "p",
+                    cmdline: vec!["p"],
+                    state: 'S',
+                    ppid: 1,
+                    rss_kb: Some(u64::from(i) * 1024),
+                    cgroup: "user.slice",
+                },
+            )
+        })
+        .collect();
+    let dir = synthetic_proc_tree(&entries);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: None,
+            cgroup_prefix: None,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert_eq!(resp.results.len(), 10);
+    // Top entry should be the largest (rss_kb = 12 * 1024).
+    assert_eq!(resp.results[0].rss_bytes, Some(12 * 1024 * 1024));
+}
+
+#[tokio::test]
+async fn top_processes_n_larger_than_population_is_fine() {
+    let dir = synthetic_proc_tree(&[(1, make_proc("only", Some(42), ""))]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: Some(1000),
+            cgroup_prefix: None,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert_eq!(resp.results.len(), 1);
+}
+
+#[tokio::test]
+async fn top_processes_cgroup_prefix_matches_subtree_including_self() {
+    let dir = synthetic_proc_tree(&[
+        (100, make_proc("self", Some(10_000), "system.slice")),
+        (
+            101,
+            make_proc("descendant", Some(5_000), "system.slice/nginx.service"),
+        ),
+        (
+            102,
+            make_proc("deep", Some(2_500), "system.slice/nested.slice/foo.service"),
+        ),
+        (200, make_proc("unrelated", Some(99_999), "user.slice")),
+    ]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: None,
+            cgroup_prefix: Some("system.slice".into()),
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    let comms: Vec<&str> = resp.results.iter().map(|p| p.comm.as_str()).collect();
+    assert_eq!(comms, vec!["self", "descendant", "deep"]);
+    assert_eq!(resp.cgroup_prefix.as_deref(), Some("system.slice"));
+}
+
+#[tokio::test]
+async fn top_processes_cgroup_prefix_does_not_match_sibling_with_shared_string() {
+    // The whole point of path-aware matching: `system.slice` must NOT
+    // match `system.slice2/...` just because the string starts the same.
+    let dir = synthetic_proc_tree(&[
+        (
+            100,
+            make_proc("real", Some(1_000), "system.slice/foo.service"),
+        ),
+        (
+            200,
+            make_proc("imposter", Some(99_999), "system.slice2/bar.service"),
+        ),
+    ]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: None,
+            cgroup_prefix: Some("system.slice".into()),
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    let comms: Vec<&str> = resp.results.iter().map(|p| p.comm.as_str()).collect();
+    assert_eq!(comms, vec!["real"]);
+}
+
+#[tokio::test]
+async fn top_processes_empty_cgroup_prefix_means_no_filter() {
+    let dir = synthetic_proc_tree(&[
+        (1, make_proc("a", Some(100), "system.slice")),
+        (2, make_proc("b", Some(200), "user.slice")),
+    ]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: None,
+            cgroup_prefix: Some(String::new()),
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert_eq!(resp.results.len(), 2);
+}
+
+#[tokio::test]
+async fn top_processes_kernel_threads_with_null_rss_sort_last() {
+    let dir = synthetic_proc_tree(&[
+        (
+            2,
+            ProcSpec {
+                comm: "kthreadd",
+                cmdline: vec![],
+                state: 'I',
+                ppid: 0,
+                rss_kb: None,
+                cgroup: "",
+            },
+        ),
+        (100, make_proc("real", Some(1_000), "system.slice")),
+    ]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: None,
+            cgroup_prefix: None,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert_eq!(resp.results.len(), 2);
+    assert_eq!(resp.results[0].comm, "real");
+    assert!(resp.results[0].rss_bytes.is_some());
+    assert_eq!(resp.results[1].comm, "kthreadd");
+    assert!(resp.results[1].rss_bytes.is_none());
+}
+
+#[tokio::test]
+async fn top_processes_redacts_cmdline_args_by_default() {
+    let leaky = ProcSpec {
+        comm: "myapp",
+        cmdline: vec!["myapp", "--api-key=hunter2", "--port=8080"],
+        state: 'R',
+        ppid: 1,
+        rss_kb: Some(1_024),
+        cgroup: "system.slice/myapp.service",
+    };
+    let dir = synthetic_proc_tree(&[(500, leaky)]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: None,
+            cgroup_prefix: None,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert_eq!(
+        resp.results[0].cmdline,
+        "myapp --api-key=REDACTED --port=8080"
+    );
+}
+
+#[tokio::test]
+async fn top_processes_rejects_absolute_cgroup_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let err = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: None,
+            cgroup_prefix: Some("/system.slice".into()),
+            redact_args: None,
+        }))
+        .await
+        .err()
+        .expect("absolute should fail");
+    assert!(format!("{err}").contains("relative"));
+}
+
+#[tokio::test]
+async fn top_processes_rejects_dotdot_in_cgroup_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let err = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: None,
+            cgroup_prefix: Some("system.slice/..".into()),
+            redact_args: None,
+        }))
+        .await
+        .err()
+        .expect("dotdot should fail");
+    assert!(format!("{err}").contains(".."));
+}
+
+#[tokio::test]
+async fn top_processes_counts_skipped_for_unreadable_pid_dirs() {
+    let dir = synthetic_proc_tree(&[(100, make_proc("real", Some(1_024), "system.slice"))]);
+    fs::create_dir(dir.path().join("999")).unwrap(); // missing files
+
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .top_processes(Parameters(TopProcessesParams {
+            n: None,
+            cgroup_prefix: None,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert_eq!(resp.results.len(), 1);
+    assert_eq!(resp.skipped, 1);
 }

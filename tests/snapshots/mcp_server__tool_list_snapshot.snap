@@ -1,6 +1,6 @@
 ---
 source: tests/mcp_server.rs
-assertion_line: 28
+assertion_line: 29
 expression: summary
 ---
 - description: "Returns the processes inside a given cgroup. Takes a cgroup_path in normalized form (relative to /sys/fs/cgroup, no leading slash, empty string for the root cgroup) and returns each process with comm, cmdline, state, ppid, and rss_bytes. Use this to drill into a cgroup identified via cgroup-mcp's tools. The cgroup_path from any cgroup-mcp output can be passed here verbatim; both servers use the same identifier convention. Results are sorted descending by rss_bytes, with null values (kernel threads with no userspace memory map) last. cmdline args matching *key*=*, *token*=*, *password*=*, *secret*=* are redacted by default; set redact_args=false to receive them verbatim. The `skipped` field counts PIDs encountered in /proc that could not be fully read (transient process death, permission denied). Non-zero means the snapshot may be incomplete."
@@ -26,10 +26,10 @@ expression: summary
       ProcessEntry:
         properties:
           cgroup_path:
-            description: "Normalized cgroup path. Equal to the requested `cgroup_path`;\nechoed for parity with other identifier-bearing tools."
+            description: "Normalized cgroup path. Same convention as cgroup-mcp: relative to\n`/sys/fs/cgroup`, no leading slash, empty string for the root."
             type: string
           cmdline:
-            description: "Space-joined cmdline from `/proc/<pid>/cmdline`. Empty for kernel\nthreads. Subject to `redact_args`."
+            description: "Space-joined cmdline from `/proc/<pid>/cmdline`. Empty for kernel\nthreads. Subject to the redaction flag the tool was called with."
             type: string
           comm:
             description: "15-character kernel name from `/proc/<pid>/comm`."
@@ -43,7 +43,7 @@ expression: summary
             minimum: 0
             type: integer
           rss_bytes:
-            description: "Resident set size in bytes. Null for kernel threads (which have no\nuserspace memory map). Sort key: results are returned descending\nby this value, with nulls last."
+            description: "Resident set size in bytes. Null for kernel threads, which have\nno userspace memory map."
             format: uint64
             minimum: 0
             type:
@@ -80,4 +80,92 @@ expression: summary
       - results
       - skipped
     title: PidsInCgroupResponse
+    type: object
+- description: "Returns the top N processes ranked by resident memory (rss_bytes), descending. Use this to answer 'what's using the most memory on this box.' Pass `cgroup_prefix` to scope the search to a cgroup subtree. The match is path-aware: `system.slice` matches `system.slice` itself and any descendant (e.g. `system.slice/nginx.service`), but NOT siblings like `system.slice2`. Take cgroup paths verbatim from any cgroup-mcp tool output. Results are returned with the same shape as `pids_in_cgroup`: pid, comm, cmdline (redacted by default; pass `redact_args=false` for verbatim), state, ppid, rss_bytes, and cgroup_path. Kernel threads (null rss_bytes) sort last. Default n is 10. CPU-based ranking is planned but not yet implemented; current sort is memory only."
+  input_schema:
+    $schema: "https://json-schema.org/draft/2020-12/schema"
+    properties:
+      cgroup_prefix:
+        default: ~
+        description: "If supplied, only consider processes whose cgroup path equals\nthis prefix or is a descendant of it. Path-aware matching:\n`system.slice` matches `system.slice` itself and any path\nstarting with `system.slice/`, but never `system.slice2/...`.\nEmpty string and omitted both mean \"consider all processes.\"\nMust not be absolute or contain `..` segments."
+        type:
+          - string
+          - "null"
+      n:
+        default: ~
+        description: Maximum number of processes to return. Defaults to 10.
+        format: uint
+        minimum: 0
+        type:
+          - integer
+          - "null"
+      redact_args:
+        default: ~
+        description: "If true (the default), command-line arguments whose key matches\n`*key*=*`, `*token*=*`, `*password*=*`, `*secret*=*`\n(case-insensitive) are replaced with `key=REDACTED`."
+        type:
+          - boolean
+          - "null"
+    title: TopProcessesParams
+    type: object
+  name: top_processes
+  output_schema:
+    $defs:
+      ProcessEntry:
+        properties:
+          cgroup_path:
+            description: "Normalized cgroup path. Same convention as cgroup-mcp: relative to\n`/sys/fs/cgroup`, no leading slash, empty string for the root."
+            type: string
+          cmdline:
+            description: "Space-joined cmdline from `/proc/<pid>/cmdline`. Empty for kernel\nthreads. Subject to the redaction flag the tool was called with."
+            type: string
+          comm:
+            description: "15-character kernel name from `/proc/<pid>/comm`."
+            type: string
+          pid:
+            format: uint32
+            minimum: 0
+            type: integer
+          ppid:
+            format: uint32
+            minimum: 0
+            type: integer
+          rss_bytes:
+            description: "Resident set size in bytes. Null for kernel threads, which have\nno userspace memory map."
+            format: uint64
+            minimum: 0
+            type:
+              - integer
+              - "null"
+          state:
+            description: "Single-character state code from `/proc/<pid>/status`:\n`R`unning, `S`leeping, `D`isk-wait, `Z`ombie, `T`raced/stopped,\n`I`dle (kernel threads). Returned as a string for JSON portability."
+            type: string
+        required:
+          - pid
+          - comm
+          - cmdline
+          - state
+          - ppid
+          - cgroup_path
+        type: object
+    $schema: "https://json-schema.org/draft/2020-12/schema"
+    properties:
+      cgroup_prefix:
+        description: Echoes the cgroup_prefix filter (or null if not provided).
+        type:
+          - string
+          - "null"
+      results:
+        description: "Top processes, sorted descending by `rss_bytes`, with null values\n(kernel threads) at the end."
+        items:
+          $ref: "#/$defs/ProcessEntry"
+        type: array
+      skipped:
+        description: "Count of PIDs encountered in `/proc` that could not be fully read\n(transient process death, permission denied, etc.). Non-zero\nmeans the snapshot may be incomplete."
+        format: uint32
+        minimum: 0
+        type: integer
+    required:
+      - results
+      - skipped
+    title: TopProcessesResponse
     type: object

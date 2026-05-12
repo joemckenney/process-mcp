@@ -5,6 +5,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, Json, ServerH
 use std::path::PathBuf;
 
 use crate::mcp::tools::pids_in_cgroup::{self, PidsInCgroupParams, PidsInCgroupResponse};
+use crate::mcp::tools::top_processes::{self, TopProcessesParams, TopProcessesResponse};
 
 #[derive(Debug, Clone)]
 pub struct ProcessServer {
@@ -60,6 +61,37 @@ impl ProcessServer {
         Parameters(params): Parameters<PidsInCgroupParams>,
     ) -> Result<Json<PidsInCgroupResponse>, McpError> {
         pids_in_cgroup::run(&self.proc_root, params)
+            .map(Json)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+    }
+
+    /// Returns the top N processes system-wide, ranked by resident
+    /// memory. Optionally scoped to a cgroup subtree via cgroup_prefix.
+    /// Sort is by memory only for now; CPU rate sampling is planned but
+    /// not yet implemented.
+    #[tool(
+        name = "top_processes",
+        description = "Returns the top N processes ranked by resident memory (rss_bytes), \
+            descending. Use this to answer 'what's using the most memory on this box.' \
+            \
+            Pass `cgroup_prefix` to scope the search to a cgroup subtree. The match is \
+            path-aware: `system.slice` matches `system.slice` itself and any descendant \
+            (e.g. `system.slice/nginx.service`), but NOT siblings like `system.slice2`. \
+            Take cgroup paths verbatim from any cgroup-mcp tool output. \
+            \
+            Results are returned with the same shape as `pids_in_cgroup`: pid, comm, \
+            cmdline (redacted by default; pass `redact_args=false` for verbatim), \
+            state, ppid, rss_bytes, and cgroup_path. Kernel threads (null rss_bytes) \
+            sort last. Default n is 10. \
+            \
+            CPU-based ranking is planned but not yet implemented; current sort is \
+            memory only."
+    )]
+    pub async fn top_processes(
+        &self,
+        Parameters(params): Parameters<TopProcessesParams>,
+    ) -> Result<Json<TopProcessesResponse>, McpError> {
+        top_processes::run(&self.proc_root, params)
             .map(Json)
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }

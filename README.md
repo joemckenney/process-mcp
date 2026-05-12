@@ -10,7 +10,7 @@ The motivating case: cgroup-level state tells you "this 2.2 GB scope is the heav
 
 ## Status
 
-Early. One tool shipped. See [PLAN.md](./PLAN.md) for the full design document and tool roadmap.
+Early. Two tools shipped. See [PLAN.md](./PLAN.md) for the full design document and tool roadmap.
 
 ## Planned tools
 
@@ -19,10 +19,11 @@ Driven by [PLAN.md](./PLAN.md), sequenced by dogfooding feedback.
 Shipped:
 
 - `pids_in_cgroup`: given a cgroup path, list the processes inside it with `comm`, `cmdline` (redacted by default), `state`, `ppid`, `rss_bytes`
+- `top_processes`: rank processes system-wide by memory, with an optional `cgroup_prefix` filter for path-aware subtree scoping
 
 Next up:
 
-- `top_processes`: rank PIDs by memory (default) or CPU rate, with optional `cgroup_prefix` filter
+- `top_processes(sort="cpu")`: CPU rate sampling, same blocking pattern as cgroup-mcp's `top_cpu`
 - `process_info`: full per-PID drill-down bundle, peer of cgroup-mcp's `get_unit_stats`
 - `process_tree`: parent/child forest under a root PID or cgroup (phase 2)
 
@@ -61,6 +62,10 @@ The proc root defaults to `/proc`. Override with `--proc-root <path>` if needed 
 Takes a cgroup path in process-mcp's normalized form (relative to `/sys/fs/cgroup`, no leading slash, empty string for the root cgroup) and returns the processes inside it. Each entry carries `pid`, `comm`, `cmdline`, `state`, `ppid`, `rss_bytes`, and `cgroup_path`. Results are sorted by `rss_bytes` descending with `null` (kernel threads) last. Cmdline args matching `*key=*`, `*token=*`, `*password=*`, `*secret=*` are redacted by default; pass `redact_args=false` to receive them verbatim. A `skipped` count surfaces PIDs that vanished or were unreadable mid-walk so the agent knows when the snapshot may be incomplete.
 
 This is the bridge tool between process-mcp and [cgroup-mcp](https://github.com/joemckenney/cgroup-mcp): take a cgroup path from any cgroup-mcp result and pass it here verbatim. Both servers use the same identifier convention.
+
+### top_processes
+
+Returns the top N processes system-wide, ranked by `rss_bytes` descending. Default `n` is 10. Same entry shape as `pids_in_cgroup`. Pass `cgroup_prefix` to scope the search to a cgroup subtree; matching is path-aware so `system.slice` matches the slice itself and any descendant but never siblings like `system.slice2`. The same `redact_args` policy applies. Sort is by memory only for now; CPU rate sampling is planned but not yet implemented.
 
 ## Tests
 
