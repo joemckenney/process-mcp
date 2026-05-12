@@ -1,11 +1,13 @@
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{tool_handler, tool_router, ServerHandler};
+use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, Json, ServerHandler};
 use std::path::PathBuf;
+
+use crate::mcp::tools::pids_in_cgroup::{self, PidsInCgroupParams, PidsInCgroupResponse};
 
 #[derive(Debug, Clone)]
 pub struct ProcessServer {
-    #[allow(dead_code)] // used by tools as they land
     proc_root: PathBuf,
     tool_router: ToolRouter<Self>,
 }
@@ -27,9 +29,40 @@ impl ProcessServer {
 
 #[tool_router(router = tool_router)]
 impl ProcessServer {
-    // Tools land here as they're built. The router is intentionally empty
-    // in the scaffold so the MCP handshake works end-to-end before any
-    // data plane exists.
+    /// Returns the processes inside a given cgroup, each enriched with
+    /// `comm`, `cmdline`, `state`, `ppid`, `rss_bytes`, and the
+    /// `cgroup_path` itself (matching cgroup-mcp's identifier
+    /// normalization). This is the bridge tool between cgroup-mcp and
+    /// process-mcp: take a cgroup path from any cgroup-mcp result and
+    /// pass it here verbatim to drill into the actual processes.
+    #[tool(
+        name = "pids_in_cgroup",
+        description = "Returns the processes inside a given cgroup. Takes a cgroup_path \
+            in normalized form (relative to /sys/fs/cgroup, no leading slash, empty \
+            string for the root cgroup) and returns each process with comm, cmdline, \
+            state, ppid, and rss_bytes. \
+            \
+            Use this to drill into a cgroup identified via cgroup-mcp's tools. The \
+            cgroup_path from any cgroup-mcp output can be passed here verbatim; both \
+            servers use the same identifier convention. \
+            \
+            Results are sorted descending by rss_bytes, with null values (kernel \
+            threads with no userspace memory map) last. cmdline args matching \
+            *key*=*, *token*=*, *password*=*, *secret*=* are redacted by default; \
+            set redact_args=false to receive them verbatim. \
+            \
+            The `skipped` field counts PIDs encountered in /proc that could not be \
+            fully read (transient process death, permission denied). Non-zero means \
+            the snapshot may be incomplete."
+    )]
+    pub async fn pids_in_cgroup(
+        &self,
+        Parameters(params): Parameters<PidsInCgroupParams>,
+    ) -> Result<Json<PidsInCgroupResponse>, McpError> {
+        pids_in_cgroup::run(&self.proc_root, params)
+            .map(Json)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]

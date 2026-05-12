@@ -10,15 +10,18 @@ The motivating case: cgroup-level state tells you "this 2.2 GB scope is the heav
 
 ## Status
 
-Early development. No tools shipped yet. The scaffold establishes the MCP server skeleton, CI pipeline, and snapshot-locked tool catalog. See [PLAN.md](./PLAN.md) for the design document and tool roadmap.
+Early. One tool shipped. See [PLAN.md](./PLAN.md) for the full design document and tool roadmap.
 
 ## Planned tools
 
-Driven by [PLAN.md](./PLAN.md), sequenced by dogfooding feedback once the first tool lands.
+Driven by [PLAN.md](./PLAN.md), sequenced by dogfooding feedback.
+
+Shipped:
+
+- `pids_in_cgroup`: given a cgroup path, list the processes inside it with `comm`, `cmdline` (redacted by default), `state`, `ppid`, `rss_bytes`
 
 Next up:
 
-- `pids_in_cgroup`: given a cgroup path, list the processes inside it with `comm`, `cmdline`, `rss_bytes`, `ppid`
 - `top_processes`: rank PIDs by memory (default) or CPU rate, with optional `cgroup_prefix` filter
 - `process_info`: full per-PID drill-down bundle, peer of cgroup-mcp's `get_unit_stats`
 - `process_tree`: parent/child forest under a root PID or cgroup (phase 2)
@@ -51,13 +54,21 @@ cargo build --release
 
 The proc root defaults to `/proc`. Override with `--proc-root <path>` if needed (useful for testing against captured fixtures).
 
+## Tools
+
+### pids_in_cgroup
+
+Takes a cgroup path in process-mcp's normalized form (relative to `/sys/fs/cgroup`, no leading slash, empty string for the root cgroup) and returns the processes inside it. Each entry carries `pid`, `comm`, `cmdline`, `state`, `ppid`, `rss_bytes`, and `cgroup_path`. Results are sorted by `rss_bytes` descending with `null` (kernel threads) last. Cmdline args matching `*key=*`, `*token=*`, `*password=*`, `*secret=*` are redacted by default; pass `redact_args=false` to receive them verbatim. A `skipped` count surfaces PIDs that vanished or were unreadable mid-walk so the agent knows when the snapshot may be incomplete.
+
+This is the bridge tool between process-mcp and [cgroup-mcp](https://github.com/joemckenney/cgroup-mcp): take a cgroup path from any cgroup-mcp result and pass it here verbatim. Both servers use the same identifier convention.
+
 ## Tests
 
 ```sh
 cargo test
 ```
 
-The scaffold ships with a `tool_list_snapshot` test that locks the public tool surface against drift. Tool descriptions are how the LLM picks tools, so the snapshot is intentionally noisy on change.
+The crate ships with a `tool_list_snapshot` test that locks the public tool surface against drift. Tool descriptions are how the LLM picks tools, so the snapshot is intentionally noisy on change.
 
 ## Releases
 

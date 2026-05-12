@@ -1,6 +1,83 @@
 ---
 source: tests/mcp_server.rs
-assertion_line: 25
+assertion_line: 28
 expression: summary
 ---
-[]
+- description: "Returns the processes inside a given cgroup. Takes a cgroup_path in normalized form (relative to /sys/fs/cgroup, no leading slash, empty string for the root cgroup) and returns each process with comm, cmdline, state, ppid, and rss_bytes. Use this to drill into a cgroup identified via cgroup-mcp's tools. The cgroup_path from any cgroup-mcp output can be passed here verbatim; both servers use the same identifier convention. Results are sorted descending by rss_bytes, with null values (kernel threads with no userspace memory map) last. cmdline args matching *key*=*, *token*=*, *password*=*, *secret*=* are redacted by default; set redact_args=false to receive them verbatim. The `skipped` field counts PIDs encountered in /proc that could not be fully read (transient process death, permission denied). Non-zero means the snapshot may be incomplete."
+  input_schema:
+    $schema: "https://json-schema.org/draft/2020-12/schema"
+    properties:
+      cgroup_path:
+        description: "Cgroup path to filter by, in normalized form: relative to\n`/sys/fs/cgroup`, no leading slash, empty string for the root\ncgroup. Example: `\"system.slice/nginx.service\"`. Take this value\nverbatim from any cgroup-mcp tool output that returns cgroup\npaths. Must not be absolute and must not contain `..` segments."
+        type: string
+      redact_args:
+        default: ~
+        description: "If true (the default), command-line arguments whose key matches\n`*key*=*`, `*token*=*`, `*password*=*`, `*secret*=*`\n(case-insensitive) are replaced with `key=REDACTED` in the\nreturned `cmdline`. Set to false to receive verbatim cmdlines at\nthe risk of leaking secrets that were passed as CLI args."
+        type:
+          - boolean
+          - "null"
+    required:
+      - cgroup_path
+    title: PidsInCgroupParams
+    type: object
+  name: pids_in_cgroup
+  output_schema:
+    $defs:
+      ProcessEntry:
+        properties:
+          cgroup_path:
+            description: "Normalized cgroup path. Equal to the requested `cgroup_path`;\nechoed for parity with other identifier-bearing tools."
+            type: string
+          cmdline:
+            description: "Space-joined cmdline from `/proc/<pid>/cmdline`. Empty for kernel\nthreads. Subject to `redact_args`."
+            type: string
+          comm:
+            description: "15-character kernel name from `/proc/<pid>/comm`."
+            type: string
+          pid:
+            format: uint32
+            minimum: 0
+            type: integer
+          ppid:
+            format: uint32
+            minimum: 0
+            type: integer
+          rss_bytes:
+            description: "Resident set size in bytes. Null for kernel threads (which have no\nuserspace memory map). Sort key: results are returned descending\nby this value, with nulls last."
+            format: uint64
+            minimum: 0
+            type:
+              - integer
+              - "null"
+          state:
+            description: "Single-character state code from `/proc/<pid>/status`:\n`R`unning, `S`leeping, `D`isk-wait, `Z`ombie, `T`raced/stopped,\n`I`dle (kernel threads). Returned as a string for JSON portability."
+            type: string
+        required:
+          - pid
+          - comm
+          - cmdline
+          - state
+          - ppid
+          - cgroup_path
+        type: object
+    $schema: "https://json-schema.org/draft/2020-12/schema"
+    properties:
+      cgroup_path:
+        description: Echoes the queried cgroup_path.
+        type: string
+      results:
+        description: "Processes in the cgroup, sorted descending by `rss_bytes` (null\nvalues last)."
+        items:
+          $ref: "#/$defs/ProcessEntry"
+        type: array
+      skipped:
+        description: "Count of PIDs encountered in `/proc` that could not be fully read\n(transient process death, permission denied, etc.). Non-zero\nmeans the snapshot may be incomplete."
+        format: uint32
+        minimum: 0
+        type: integer
+    required:
+      - cgroup_path
+      - results
+      - skipped
+    title: PidsInCgroupResponse
+    type: object
