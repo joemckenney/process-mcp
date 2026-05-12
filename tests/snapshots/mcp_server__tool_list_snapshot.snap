@@ -1,0 +1,6 @@
+---
+source: tests/mcp_server.rs
+assertion_line: 25
+expression: summary
+---
+[]
