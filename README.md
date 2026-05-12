@@ -23,10 +23,20 @@ Next up:
 - `process_info`: full per-PID drill-down bundle, peer of cgroup-mcp's `get_unit_stats`
 - `process_tree`: parent/child forest under a root PID or cgroup (phase 2)
 
+## Installation
+
+Once the first release ships, install via:
+
+```sh
+curl -sSf https://raw.githubusercontent.com/joemckenney/process-mcp/main/install.sh | sh
+```
+
+Linux only. Pre-built binaries for `x86_64` and `aarch64`. Until v0.1.0 lands, build from source (see below).
+
 ## Requirements
 
 - Linux with a procfs mount at `/proc`. Default on every distro.
-- Rust toolchain to build.
+- Rust toolchain if building from source.
 
 Does not run on macOS, Windows, or BSD. `/proc` formats are Linux-specific.
 
@@ -48,6 +58,12 @@ cargo test
 ```
 
 The scaffold ships with a `tool_list_snapshot` test that locks the public tool surface against drift. Tool descriptions are how the LLM picks tools, so the snapshot is intentionally noisy on change.
+
+## Releases
+
+Driven by [release-plz](https://release-plz.dev) reading [conventional commits](https://www.conventionalcommits.org/). On push to `main`, the workflow inspects commits since the last `v*` tag. If any imply a version bump (`feat:` for minor, `fix:` for patch, `feat!:` or `BREAKING CHANGE:` for major; pre-1.0, breaking changes bump minor), it opens a `chore: release vX.Y.Z` PR with version + changelog. Merging that PR tags the commit and triggers the binary workflow, which builds `x86_64` and `aarch64` tarballs via `cross` and uploads them to the GitHub Release.
+
+This repo does not publish to crates.io. Releases are GitHub Releases only.
 
 ## Design notes
 

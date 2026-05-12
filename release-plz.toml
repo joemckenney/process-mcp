@@ -1,0 +1,30 @@
+# Release automation config. See https://release-plz.dev/docs/config
+#
+# How this works:
+#   1. release-plz workflow runs on every push to main.
+#   2. If unreleased commits since the last v* tag imply a version bump
+#      (per conventional commits), release-plz opens or updates a PR with
+#      the version bump and CHANGELOG additions.
+#   3. Merging that PR triggers the workflow again. release-plz then
+#      creates the v* tag and a GitHub Release with the changelog body.
+#   4. release-binaries.yml fires on the new tag and uploads binaries.
+#
+# We do not publish to crates.io. Distribution is GitHub Releases only.
+
+[workspace]
+# Skip `cargo publish` entirely.
+#
+# Why this lives only here and NOT in Cargo.toml: release-plz reads
+# Cargo.toml's `publish` field and interprets `false` as "skip this
+# crate entirely," which silently disables the version-bump release PR.
+# Setting `publish = false` here suppresses the crates.io step without
+# making release-plz think the crate is non-releasable.
+publish = false
+
+# Create the v* git tag when the release PR is merged.
+git_tag_enable = true
+
+# Create a GitHub Release with the changelog body. release-binaries.yml
+# attaches tar.gz archives + sha256 files on top of this.
+git_release_enable = true
+git_release_draft = false

@@ -1,0 +1,40 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+
+# Single concurrency group so two pushes can't race the release PR.
+concurrency:
+  group: release-plz-${{ github.ref }}
+
+jobs:
+  release-plz:
+    name: Release-plz
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to push the release branch, the release tag, and create
+      # GitHub Releases.
+      contents: write
+      # Required to open and update the release PR.
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # release-plz needs the full history to build the changelog.
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        # Pinned to v0.5 (moving minor tag) because @v0 was retired upstream.
+        uses: MarcoIeni/release-plz-action@v0.5
+        env:
+          # Using a fine-grained PAT instead of GITHUB_TOKEN so that the
+          # v* tag pushed by release-plz triggers release-binaries.yml.
+          # GITHUB_TOKEN-initiated pushes do not trigger downstream
+          # workflows (GitHub's loop-prevention behavior). The PAT needs
+          # `contents: write` and `pull-requests: write` scoped to this repo.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
