@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::mcp::tools::pids_in_cgroup::{self, PidsInCgroupParams, PidsInCgroupResponse};
 use crate::mcp::tools::process_info::{self, ProcessInfoParams, ProcessInfoResponse};
+use crate::mcp::tools::process_tree::{self, ProcessTreeParams, ProcessTreeResponse};
 use crate::mcp::tools::top_processes::{self, TopProcessesParams, TopProcessesResponse};
 
 #[derive(Debug, Clone)]
@@ -125,6 +126,37 @@ impl ProcessServer {
         Parameters(params): Parameters<ProcessInfoParams>,
     ) -> Result<Json<ProcessInfoResponse>, McpError> {
         process_info::run(&self.proc_root, params)
+            .map(Json)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+    }
+
+    /// Returns a parent/child process forest, either rooted at a single
+    /// PID (and all its descendants) or scoped to a cgroup (showing
+    /// in-cgroup parent/child relationships).
+    #[tool(
+        name = "process_tree",
+        description = "Returns a parent/child process forest. Two mutually exclusive modes: \
+            \
+            1. Pass `root_pid` to root the tree at one PID. The result is a single-element \
+            forest with that PID at top, every descendant nested underneath. Useful for \
+            unpacking Chrome's main + renderer + GPU process model, systemd-managed \
+            supervisor trees, language runtimes that fork many workers, etc. \
+            \
+            2. Pass `cgroup_path` to get the forest of processes inside a cgroup, \
+            organized by in-cgroup parent/child relationships. A PID whose parent is \
+            outside the cgroup becomes a forest root. Useful for understanding the \
+            structure of a heavy cgroup identified via cgroup-mcp. \
+            \
+            Each node carries the same identifier fields as other tools (pid, comm, \
+            cmdline, state, ppid, rss_bytes, cgroup_path) plus a `children` array. \
+            Children are sorted by rss_bytes desc with nulls last. Cmdline redaction \
+            and the `skipped` count work the same as the other tools."
+    )]
+    pub async fn process_tree(
+        &self,
+        Parameters(params): Parameters<ProcessTreeParams>,
+    ) -> Result<Json<ProcessTreeResponse>, McpError> {
+        process_tree::run(&self.proc_root, params)
             .map(Json)
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }

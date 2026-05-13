@@ -1,6 +1,7 @@
 use process_mcp::mcp::server::ProcessServer;
 use process_mcp::mcp::tools::pids_in_cgroup::PidsInCgroupParams;
 use process_mcp::mcp::tools::process_info::ProcessInfoParams;
+use process_mcp::mcp::tools::process_tree::ProcessTreeParams;
 use process_mcp::mcp::tools::top_processes::TopProcessesParams;
 use rmcp::handler::server::wrapper::Parameters;
 use std::fs;
@@ -849,4 +850,344 @@ async fn process_info_carries_uid_and_threads_from_status() {
         .0;
     assert_eq!(resp.uid, 1000);
     assert_eq!(resp.num_threads, 8);
+}
+
+// ---- process_tree ----
+
+#[tokio::test]
+async fn process_tree_root_pid_mode_builds_descendants() {
+    // Chrome-like: main process 100, three children (renderer/gpu/etc).
+    let dir = synthetic_proc_tree(&[
+        (
+            100,
+            ProcSpec {
+                comm: "chrome",
+                cmdline: vec!["chrome"],
+                state: 'S',
+                ppid: 1,
+                rss_kb: Some(50_000),
+                cgroup: "user.slice/session.scope",
+            },
+        ),
+        (
+            101,
+            ProcSpec {
+                comm: "chrome",
+                cmdline: vec!["chrome", "--type=renderer"],
+                state: 'S',
+                ppid: 100,
+                rss_kb: Some(80_000),
+                cgroup: "user.slice/session.scope",
+            },
+        ),
+        (
+            102,
+            ProcSpec {
+                comm: "chrome",
+                cmdline: vec!["chrome", "--type=renderer"],
+                state: 'S',
+                ppid: 100,
+                rss_kb: Some(30_000),
+                cgroup: "user.slice/session.scope",
+            },
+        ),
+        (
+            103,
+            ProcSpec {
+                comm: "chrome",
+                cmdline: vec!["chrome", "--type=gpu-process"],
+                state: 'S',
+                ppid: 100,
+                rss_kb: Some(20_000),
+                cgroup: "user.slice/session.scope",
+            },
+        ),
+    ]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_tree(Parameters(ProcessTreeParams {
+            root_pid: Some(100),
+            cgroup_path: None,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+
+    assert_eq!(resp.root_pid, Some(100));
+    assert!(resp.cgroup_path.is_none());
+    assert_eq!(resp.forest.len(), 1);
+
+    let root = &resp.forest[0];
+    assert_eq!(root.base.pid, 100);
+    assert_eq!(root.children.len(), 3);
+    // Children sorted by RSS desc: 101 (80MB), 102 (30MB), 103 (20MB).
+    assert_eq!(root.children[0].base.pid, 101);
+    assert_eq!(root.children[1].base.pid, 102);
+    assert_eq!(root.children[2].base.pid, 103);
+}
+
+#[tokio::test]
+async fn process_tree_root_pid_includes_nested_grandchildren() {
+    let dir = synthetic_proc_tree(&[
+        (
+            100,
+            ProcSpec {
+                comm: "supervisor",
+                cmdline: vec!["supervisor"],
+                state: 'S',
+                ppid: 1,
+                rss_kb: Some(10_000),
+                cgroup: "",
+            },
+        ),
+        (
+            101,
+            ProcSpec {
+                comm: "worker",
+                cmdline: vec!["worker"],
+                state: 'S',
+                ppid: 100,
+                rss_kb: Some(5_000),
+                cgroup: "",
+            },
+        ),
+        (
+            102,
+            ProcSpec {
+                comm: "subworker",
+                cmdline: vec!["subworker"],
+                state: 'S',
+                ppid: 101,
+                rss_kb: Some(1_000),
+                cgroup: "",
+            },
+        ),
+    ]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_tree(Parameters(ProcessTreeParams {
+            root_pid: Some(100),
+            cgroup_path: None,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+
+    let root = &resp.forest[0];
+    assert_eq!(root.children.len(), 1);
+    let worker = &root.children[0];
+    assert_eq!(worker.base.pid, 101);
+    assert_eq!(worker.children.len(), 1);
+    assert_eq!(worker.children[0].base.pid, 102);
+}
+
+#[tokio::test]
+async fn process_tree_root_pid_errors_for_nonexistent_pid() {
+    let dir = synthetic_proc_tree(&[(100, nginx_master())]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let err = server
+        .process_tree(Parameters(ProcessTreeParams {
+            root_pid: Some(99999),
+            cgroup_path: None,
+            redact_args: None,
+        }))
+        .await
+        .err()
+        .expect("missing pid should error");
+    assert!(format!("{err}").contains("not found"));
+}
+
+#[tokio::test]
+async fn process_tree_cgroup_mode_forest_has_in_cgroup_parents_as_roots() {
+    // PID 100 (parent=1, in cgroup) is the in-cgroup root because its
+    // parent is outside the cgroup. PID 101 (parent=100) and PID 102
+    // (parent=100) are children. PID 200 (parent=1, also in cgroup but
+    // unrelated to 100's tree) becomes a separate forest root.
+    let dir = synthetic_proc_tree(&[
+        (
+            1,
+            ProcSpec {
+                comm: "systemd",
+                cmdline: vec!["systemd"],
+                state: 'S',
+                ppid: 0,
+                rss_kb: Some(1_000),
+                cgroup: "", // outside the target cgroup
+            },
+        ),
+        (
+            100,
+            ProcSpec {
+                comm: "chrome",
+                cmdline: vec!["chrome"],
+                state: 'S',
+                ppid: 1,
+                rss_kb: Some(50_000),
+                cgroup: "user.slice/session.scope",
+            },
+        ),
+        (
+            101,
+            ProcSpec {
+                comm: "chrome",
+                cmdline: vec!["chrome", "--type=renderer"],
+                state: 'S',
+                ppid: 100,
+                rss_kb: Some(80_000),
+                cgroup: "user.slice/session.scope",
+            },
+        ),
+        (
+            102,
+            ProcSpec {
+                comm: "chrome",
+                cmdline: vec!["chrome", "--type=gpu"],
+                state: 'S',
+                ppid: 100,
+                rss_kb: Some(20_000),
+                cgroup: "user.slice/session.scope",
+            },
+        ),
+        (
+            200,
+            ProcSpec {
+                comm: "other",
+                cmdline: vec!["other"],
+                state: 'S',
+                ppid: 1, // also parented outside the cgroup
+                rss_kb: Some(10_000),
+                cgroup: "user.slice/session.scope",
+            },
+        ),
+    ]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_tree(Parameters(ProcessTreeParams {
+            root_pid: None,
+            cgroup_path: Some("user.slice/session.scope".into()),
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+
+    assert_eq!(
+        resp.cgroup_path.as_deref(),
+        Some("user.slice/session.scope")
+    );
+    let roots: Vec<u32> = resp.forest.iter().map(|n| n.base.pid).collect();
+    // Both 100 and 200 are roots (their parents are outside the cgroup).
+    assert_eq!(roots.len(), 2);
+    assert!(roots.contains(&100));
+    assert!(roots.contains(&200));
+
+    let chrome_root = resp.forest.iter().find(|n| n.base.pid == 100).unwrap();
+    let child_pids: Vec<u32> = chrome_root.children.iter().map(|n| n.base.pid).collect();
+    // Heavier renderer first.
+    assert_eq!(child_pids, vec![101, 102]);
+
+    // PID 1 (systemd) is NOT in the forest because it's outside the cgroup.
+    fn collect_pids(node: &process_mcp::mcp::tools::process_tree::TreeNode, out: &mut Vec<u32>) {
+        out.push(node.base.pid);
+        for c in &node.children {
+            collect_pids(c, out);
+        }
+    }
+    let mut all_pids = Vec::new();
+    for root in &resp.forest {
+        collect_pids(root, &mut all_pids);
+    }
+    assert!(!all_pids.contains(&1), "systemd should not appear");
+}
+
+#[tokio::test]
+async fn process_tree_cgroup_mode_returns_empty_for_unused_cgroup() {
+    let dir = synthetic_proc_tree(&[(100, nginx_master())]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_tree(Parameters(ProcessTreeParams {
+            root_pid: None,
+            cgroup_path: Some("user.slice/user-1000.slice/session-1.scope".into()),
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert!(resp.forest.is_empty());
+}
+
+#[tokio::test]
+async fn process_tree_redacts_cmdline_args_by_default() {
+    let dir = synthetic_proc_tree(&[(
+        500,
+        ProcSpec {
+            comm: "myapp",
+            cmdline: vec!["myapp", "--api-key=hunter2"],
+            state: 'R',
+            ppid: 1,
+            rss_kb: Some(1_024),
+            cgroup: "system.slice/myapp.service",
+        },
+    )]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_tree(Parameters(ProcessTreeParams {
+            root_pid: Some(500),
+            cgroup_path: None,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert_eq!(resp.forest[0].base.cmdline, "myapp --api-key=REDACTED");
+}
+
+#[tokio::test]
+async fn process_tree_rejects_both_modes_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let err = server
+        .process_tree(Parameters(ProcessTreeParams {
+            root_pid: Some(1),
+            cgroup_path: Some("user.slice".into()),
+            redact_args: None,
+        }))
+        .await
+        .err()
+        .expect("both should fail");
+    assert!(format!("{err}").contains("exactly one"));
+}
+
+#[tokio::test]
+async fn process_tree_rejects_neither_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let err = server
+        .process_tree(Parameters(ProcessTreeParams {
+            root_pid: None,
+            cgroup_path: None,
+            redact_args: None,
+        }))
+        .await
+        .err()
+        .expect("neither should fail");
+    assert!(format!("{err}").contains("must provide"));
+}
+
+#[tokio::test]
+async fn process_tree_validates_cgroup_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let err = server
+        .process_tree(Parameters(ProcessTreeParams {
+            root_pid: None,
+            cgroup_path: Some("/etc/passwd".into()),
+            redact_args: None,
+        }))
+        .await
+        .err()
+        .expect("absolute should fail");
+    assert!(format!("{err}").contains("relative"));
 }

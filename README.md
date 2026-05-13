@@ -44,6 +44,12 @@ Claude calls `top_processes(cgroup_prefix="user.slice")`, gets a system-wide ran
 
 Claude calls `process_info(pid=4815)` for the full drill-down: cmdline, fd count, smaps_rollup memory breakdown (RSS, PSS, shared, private, anon, swap), cumulative IO counters, parent PID, thread count, uid, cgroup path. `pss_bytes` in particular is the fairest single number for "this process's memory cost" when pages are shared across processes (browser tabs, JVM workers).
 
+```
+> Break down the Chrome process tree.
+```
+
+Claude calls `process_tree(root_pid=<chrome main>)` to get the parent/child forest underneath, then ranks renderers by RSS. The same tool works in `cgroup_path` mode to render the structure of processes inside a heavy cgroup, with PIDs whose parent is outside the cgroup becoming forest roots.
+
 ## Tools
 
 | Tool             | Purpose                                                                       |
@@ -51,6 +57,7 @@ Claude calls `process_info(pid=4815)` for the full drill-down: cmdline, fd count
 | `pids_in_cgroup` | Processes inside a given cgroup, sorted by RSS                                |
 | `top_processes`  | Top N processes by RSS system-wide, optionally scoped to a cgroup subtree     |
 | `process_info`   | Full per-PID drill-down (memory breakdown, fd count, IO counters, uid)        |
+| `process_tree`   | Parent/child forest rooted at a PID or scoped to a cgroup                     |
 
 Cmdline arguments matching `*key=*`, `*token=*`, `*password=*`, `*secret=*` (case-insensitive) are redacted by default to avoid leaking secrets passed on the command line. Pass `redact_args=false` to receive them verbatim. Permission-gated fields (`fd_count`, `memory`, `io` on `process_info`) are null when the kernel rejects the read; this is common when running as non-root or across user namespaces.
 

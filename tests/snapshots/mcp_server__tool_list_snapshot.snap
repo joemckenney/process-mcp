@@ -1,6 +1,6 @@
 ---
 source: tests/mcp_server.rs
-assertion_line: 30
+assertion_line: 31
 expression: summary
 ---
 - description: "Returns the processes inside a given cgroup. Takes a cgroup_path in normalized form (relative to /sys/fs/cgroup, no leading slash, empty string for the root cgroup) and returns each process with comm, cmdline, state, ppid, and rss_bytes. Use this to drill into a cgroup identified via cgroup-mcp's tools. The cgroup_path from any cgroup-mcp output can be passed here verbatim; both servers use the same identifier convention. Results are sorted descending by rss_bytes, with null values (kernel threads with no userspace memory map) last. cmdline args matching *key*=*, *token*=*, *password*=*, *secret*=* are redacted by default; set redact_args=false to receive them verbatim. The `skipped` field counts PIDs encountered in /proc that could not be fully read (transient process death, permission denied). Non-zero means the snapshot may be incomplete."
@@ -239,6 +239,107 @@ expression: summary
       - uid
       - num_threads
     title: ProcessInfoResponse
+    type: object
+- description: "Returns a parent/child process forest. Two mutually exclusive modes: 1. Pass `root_pid` to root the tree at one PID. The result is a single-element forest with that PID at top, every descendant nested underneath. Useful for unpacking Chrome's main + renderer + GPU process model, systemd-managed supervisor trees, language runtimes that fork many workers, etc. 2. Pass `cgroup_path` to get the forest of processes inside a cgroup, organized by in-cgroup parent/child relationships. A PID whose parent is outside the cgroup becomes a forest root. Useful for understanding the structure of a heavy cgroup identified via cgroup-mcp. Each node carries the same identifier fields as other tools (pid, comm, cmdline, state, ppid, rss_bytes, cgroup_path) plus a `children` array. Children are sorted by rss_bytes desc with nulls last. Cmdline redaction and the `skipped` count work the same as the other tools."
+  input_schema:
+    $schema: "https://json-schema.org/draft/2020-12/schema"
+    properties:
+      cgroup_path:
+        default: ~
+        description: "Root the tree at this cgroup. Returns a forest of all PIDs in the\ncgroup, organized by parent/child relationships among PIDs in the\nsame cgroup. A PID whose parent is outside the cgroup becomes a\nforest root. Mutually exclusive with `root_pid`. Path must not be\nabsolute and must not contain `..` segments."
+        type:
+          - string
+          - "null"
+      redact_args:
+        default: ~
+        description: "If true (the default), command-line arguments whose key matches\n`*key*=*`, `*token*=*`, `*password*=*`, `*secret*=*` are redacted."
+        type:
+          - boolean
+          - "null"
+      root_pid:
+        default: ~
+        description: "Root the tree at this PID. Returns a single-element forest with\n`root_pid` at top and every descendant (transitively) nested under\nit. Mutually exclusive with `cgroup_path`."
+        format: uint32
+        minimum: 0
+        type:
+          - integer
+          - "null"
+    title: ProcessTreeParams
+    type: object
+  name: process_tree
+  output_schema:
+    $defs:
+      TreeNode:
+        properties:
+          cgroup_path:
+            description: "Normalized cgroup path. Same convention as cgroup-mcp: relative to\n`/sys/fs/cgroup`, no leading slash, empty string for the root."
+            type: string
+          children:
+            description: "Children of this node within the tree, sorted descending by\n`rss_bytes` (nulls last)."
+            items:
+              $ref: "#/$defs/TreeNode"
+            type: array
+          cmdline:
+            description: "Space-joined cmdline from `/proc/<pid>/cmdline`. Empty for kernel\nthreads. Subject to the redaction flag the tool was called with."
+            type: string
+          comm:
+            description: "15-character kernel name from `/proc/<pid>/comm`."
+            type: string
+          pid:
+            format: uint32
+            minimum: 0
+            type: integer
+          ppid:
+            format: uint32
+            minimum: 0
+            type: integer
+          rss_bytes:
+            description: "Resident set size in bytes. Null for kernel threads, which have\nno userspace memory map."
+            format: uint64
+            minimum: 0
+            type:
+              - integer
+              - "null"
+          state:
+            description: "Single-character state code from `/proc/<pid>/status`:\n`R`unning, `S`leeping, `D`isk-wait, `Z`ombie, `T`raced/stopped,\n`I`dle (kernel threads). Returned as a string for JSON portability."
+            type: string
+        required:
+          - pid
+          - comm
+          - cmdline
+          - state
+          - ppid
+          - cgroup_path
+          - children
+        type: object
+    $schema: "https://json-schema.org/draft/2020-12/schema"
+    properties:
+      cgroup_path:
+        description: "Echoes `cgroup_path` if that mode was used."
+        type:
+          - string
+          - "null"
+      forest:
+        description: "Roots of the forest. For `root_pid` mode this is always a\nsingle-element vec (or empty if the PID has no children and we\nonly included root). For `cgroup_path` mode this can contain\nmultiple roots if the cgroup holds disjoint process trees."
+        items:
+          $ref: "#/$defs/TreeNode"
+        type: array
+      root_pid:
+        description: "Echoes `root_pid` if that mode was used."
+        format: uint32
+        minimum: 0
+        type:
+          - integer
+          - "null"
+      skipped:
+        description: "Count of PIDs that couldn't be fully read during the walk."
+        format: uint32
+        minimum: 0
+        type: integer
+    required:
+      - forest
+      - skipped
+    title: ProcessTreeResponse
     type: object
 - description: "Returns the top N processes ranked by resident memory (rss_bytes), descending. Use this to answer 'what's using the most memory on this box.' Pass `cgroup_prefix` to scope the search to a cgroup subtree. The match is path-aware: `system.slice` matches `system.slice` itself and any descendant (e.g. `system.slice/nginx.service`), but NOT siblings like `system.slice2`. Take cgroup paths verbatim from any cgroup-mcp tool output. Results are returned with the same shape as `pids_in_cgroup`: pid, comm, cmdline (redacted by default; pass `redact_args=false` for verbatim), state, ppid, rss_bytes, and cgroup_path. Kernel threads (null rss_bytes) sort last. Default n is 10. CPU-based ranking is planned but not yet implemented; current sort is memory only."
   input_schema:
