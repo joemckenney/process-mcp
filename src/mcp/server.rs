@@ -5,6 +5,7 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, Json, ServerH
 use std::path::PathBuf;
 
 use crate::mcp::tools::pids_in_cgroup::{self, PidsInCgroupParams, PidsInCgroupResponse};
+use crate::mcp::tools::process_info::{self, ProcessInfoParams, ProcessInfoResponse};
 use crate::mcp::tools::top_processes::{self, TopProcessesParams, TopProcessesResponse};
 
 #[derive(Debug, Clone)]
@@ -92,6 +93,38 @@ impl ProcessServer {
         Parameters(params): Parameters<TopProcessesParams>,
     ) -> Result<Json<TopProcessesResponse>, McpError> {
         top_processes::run(&self.proc_root, params)
+            .map(Json)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
+    }
+
+    /// Single-PID drill-down. Returns the same identifier fields as
+    /// pids_in_cgroup and top_processes, plus uid, num_threads, fd_count,
+    /// a memory breakdown from smaps_rollup (Rss/Pss/Shared/Private/Anon/
+    /// Swap), and IO counters. Permission-gated fields are nullable.
+    #[tool(
+        name = "process_info",
+        description = "Returns the full per-PID drill-down bundle for one process. Includes the \
+            same identifier fields as pids_in_cgroup (pid, comm, cmdline, state, ppid, \
+            rss_bytes, cgroup_path) plus uid, num_threads, fd_count, a smaps_rollup \
+            memory breakdown (Rss/Pss/Shared/Private/Anon/Swap), and IO counters. \
+            \
+            Use this after identifying a PID of interest via pids_in_cgroup or \
+            top_processes. The `memory.pss_bytes` field is the fairest single number \
+            for 'this process's memory cost' when pages are shared with other \
+            processes (browser tabs, JVM workers, etc.). \
+            \
+            Permission-gated fields are nullable when the kernel rejects the read: \
+            `fd_count` and `io` typically require ptrace capability or matching uid; \
+            `memory` is null for kernel threads. Cmdline args matching *key=*, \
+            *token=*, *password=*, *secret=* are redacted by default; pass \
+            `redact_args=false` to receive them verbatim. Errors if the PID does not \
+            exist."
+    )]
+    pub async fn process_info(
+        &self,
+        Parameters(params): Parameters<ProcessInfoParams>,
+    ) -> Result<Json<ProcessInfoResponse>, McpError> {
+        process_info::run(&self.proc_root, params)
             .map(Json)
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))
     }

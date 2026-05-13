@@ -1,9 +1,10 @@
 use process_mcp::mcp::server::ProcessServer;
 use process_mcp::mcp::tools::pids_in_cgroup::PidsInCgroupParams;
+use process_mcp::mcp::tools::process_info::ProcessInfoParams;
 use process_mcp::mcp::tools::top_processes::TopProcessesParams;
 use rmcp::handler::server::wrapper::Parameters;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -56,8 +57,11 @@ fn synthetic_proc_tree(entries: &[(u32, ProcSpec)]) -> TempDir {
         fs::write(pid_dir.join("cgroup"), format!("0::/{}\n", spec.cgroup)).unwrap();
         fs::write(pid_dir.join("comm"), format!("{}\n", spec.comm)).unwrap();
 
+        // Synthetic status with the fields parse_status needs. Uid and
+        // Threads default to 0/1; tests that exercise them override via
+        // direct file writes after this helper runs.
         let mut status = format!(
-            "Name:\t{}\nState:\t{} (running)\nPPid:\t{}\n",
+            "Name:\t{}\nState:\t{} (running)\nPPid:\t{}\nUid:\t0\t0\t0\t0\nThreads:\t1\n",
             spec.comm, spec.state, spec.ppid
         );
         if let Some(kb) = spec.rss_kb {
@@ -586,4 +590,263 @@ async fn top_processes_counts_skipped_for_unreadable_pid_dirs() {
         .0;
     assert_eq!(resp.results.len(), 1);
     assert_eq!(resp.skipped, 1);
+}
+
+// ---- process_info ----
+
+/// Write a realistic smaps_rollup file into the given PID dir.
+fn write_smaps_rollup(
+    pid_dir: &Path,
+    rss_kb: u64,
+    pss_kb: u64,
+    shared_kb: u64,
+    private_kb: u64,
+    anon_kb: u64,
+    swap_kb: u64,
+) {
+    // We split shared between clean/dirty arbitrarily (the parser sums
+    // them anyway) and same for private. anon under Anonymous.
+    let body = format!(
+        "55e682908000-7ffd6aff2000 ---p 00000000 00:00 0                          [rollup]\nRss:                {rss_kb} kB\nPss:                 {pss_kb} kB\nShared_Clean:       {shared_kb} kB\nShared_Dirty:          0 kB\nPrivate_Clean:         0 kB\nPrivate_Dirty:       {private_kb} kB\nAnonymous:           {anon_kb} kB\nSwap:                {swap_kb} kB\n"
+    );
+    fs::write(pid_dir.join("smaps_rollup"), body).unwrap();
+}
+
+/// Write a realistic /proc/<pid>/io file.
+fn write_io_file(pid_dir: &Path, read_bytes: u64, write_bytes: u64, syscr: u64, syscw: u64) {
+    let body = format!(
+        "rchar: 0\nwchar: 0\nsyscr: {syscr}\nsyscw: {syscw}\nread_bytes: {read_bytes}\nwrite_bytes: {write_bytes}\ncancelled_write_bytes: 0\n"
+    );
+    fs::write(pid_dir.join("io"), body).unwrap();
+}
+
+/// Create a /proc/<pid>/fd/ directory with `count` synthetic entries.
+fn make_fd_dir(pid_dir: &Path, count: u32) {
+    let fd_dir = pid_dir.join("fd");
+    fs::create_dir(&fd_dir).unwrap();
+    for i in 0..count {
+        fs::write(fd_dir.join(i.to_string()), "").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn process_info_returns_full_bundle_for_healthy_pid() {
+    let dir = synthetic_proc_tree(&[(
+        500,
+        ProcSpec {
+            comm: "nginx",
+            cmdline: vec!["nginx", "worker process"],
+            state: 'S',
+            ppid: 1,
+            rss_kb: Some(10_240),
+            cgroup: "system.slice/nginx.service",
+        },
+    )]);
+    let pid_dir = dir.path().join("500");
+    write_smaps_rollup(&pid_dir, 10_240, 5_120, 8_192, 2_048, 1_024, 0);
+    write_io_file(&pid_dir, 1_048_576, 2_048, 100, 5);
+    make_fd_dir(&pid_dir, 7);
+
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_info(Parameters(ProcessInfoParams {
+            pid: 500,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+
+    // Base identifier fields.
+    assert_eq!(resp.base.pid, 500);
+    assert_eq!(resp.base.comm, "nginx");
+    assert_eq!(resp.base.state, "S");
+    assert_eq!(resp.base.ppid, 1);
+    assert_eq!(resp.base.cgroup_path, "system.slice/nginx.service");
+    assert_eq!(resp.base.rss_bytes, Some(10_240 * 1024));
+
+    // New process_info fields.
+    assert_eq!(resp.uid, 0);
+    assert_eq!(resp.num_threads, 1);
+    assert_eq!(resp.fd_count, Some(7));
+
+    let mem = resp.memory.expect("memory should be present");
+    assert_eq!(mem.rss_bytes, 10_240 * 1024);
+    assert_eq!(mem.pss_bytes, 5_120 * 1024);
+    assert_eq!(mem.shared_bytes, 8_192 * 1024);
+    assert_eq!(mem.private_bytes, 2_048 * 1024);
+    assert_eq!(mem.anon_bytes, 1_024 * 1024);
+    assert_eq!(mem.swap_bytes, 0);
+
+    let io = resp.io.expect("io should be present");
+    assert_eq!(io.read_bytes, 1_048_576);
+    assert_eq!(io.write_bytes, 2_048);
+    assert_eq!(io.read_syscalls, 100);
+    assert_eq!(io.write_syscalls, 5);
+}
+
+#[tokio::test]
+async fn process_info_fd_count_is_null_when_fd_dir_missing() {
+    let dir = synthetic_proc_tree(&[(
+        500,
+        ProcSpec {
+            comm: "x",
+            cmdline: vec!["x"],
+            state: 'S',
+            ppid: 1,
+            rss_kb: Some(1_024),
+            cgroup: "",
+        },
+    )]);
+    // No fd/ directory created.
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_info(Parameters(ProcessInfoParams {
+            pid: 500,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert!(resp.fd_count.is_none());
+}
+
+#[tokio::test]
+async fn process_info_memory_is_null_when_smaps_rollup_missing() {
+    // Realistic case: kernel threads have no smaps_rollup.
+    let dir = synthetic_proc_tree(&[(
+        2,
+        ProcSpec {
+            comm: "kthreadd",
+            cmdline: vec![],
+            state: 'I',
+            ppid: 0,
+            rss_kb: None,
+            cgroup: "",
+        },
+    )]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_info(Parameters(ProcessInfoParams {
+            pid: 2,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert!(resp.memory.is_none());
+    assert!(resp.base.rss_bytes.is_none());
+}
+
+#[tokio::test]
+async fn process_info_io_is_null_when_io_file_missing() {
+    let dir = synthetic_proc_tree(&[(
+        500,
+        ProcSpec {
+            comm: "x",
+            cmdline: vec!["x"],
+            state: 'S',
+            ppid: 1,
+            rss_kb: Some(1_024),
+            cgroup: "",
+        },
+    )]);
+    // No io file written.
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_info(Parameters(ProcessInfoParams {
+            pid: 500,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert!(resp.io.is_none());
+}
+
+#[tokio::test]
+async fn process_info_redacts_cmdline_by_default() {
+    let dir = synthetic_proc_tree(&[(
+        500,
+        ProcSpec {
+            comm: "myapp",
+            cmdline: vec!["myapp", "--api-key=hunter2", "--port=8080"],
+            state: 'R',
+            ppid: 1,
+            rss_kb: Some(1_024),
+            cgroup: "system.slice/myapp.service",
+        },
+    )]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_info(Parameters(ProcessInfoParams {
+            pid: 500,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert_eq!(resp.base.cmdline, "myapp --api-key=REDACTED --port=8080");
+}
+
+#[tokio::test]
+async fn process_info_errors_for_nonexistent_pid() {
+    let dir = synthetic_proc_tree(&[(
+        500,
+        ProcSpec {
+            comm: "x",
+            cmdline: vec!["x"],
+            state: 'S',
+            ppid: 1,
+            rss_kb: Some(1_024),
+            cgroup: "",
+        },
+    )]);
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let err = server
+        .process_info(Parameters(ProcessInfoParams {
+            pid: 999,
+            redact_args: None,
+        }))
+        .await
+        .err()
+        .expect("missing PID should error");
+    // Error should mention that something was not found / unreadable; we
+    // don't pin to the exact wording, just that it failed.
+    assert!(!format!("{err}").is_empty());
+}
+
+#[tokio::test]
+async fn process_info_carries_uid_and_threads_from_status() {
+    // Manually write a status with non-default uid/threads to verify
+    // the parser is picking them up.
+    let dir = synthetic_proc_tree(&[(
+        500,
+        ProcSpec {
+            comm: "x",
+            cmdline: vec!["x"],
+            state: 'S',
+            ppid: 1,
+            rss_kb: Some(1_024),
+            cgroup: "",
+        },
+    )]);
+    let pid_dir = dir.path().join("500");
+    fs::write(
+        pid_dir.join("status"),
+        "Name:\tx\nState:\tS (sleeping)\nPPid:\t1\nUid:\t1000\t1000\t1000\t1000\nThreads:\t8\nVmRSS:\t1024 kB\n",
+    )
+    .unwrap();
+
+    let server = ProcessServer::new(dir.path().to_path_buf());
+    let resp = server
+        .process_info(Parameters(ProcessInfoParams {
+            pid: 500,
+            redact_args: None,
+        }))
+        .await
+        .expect("ok")
+        .0;
+    assert_eq!(resp.uid, 1000);
+    assert_eq!(resp.num_threads, 8);
 }

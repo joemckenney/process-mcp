@@ -1,6 +1,6 @@
 ---
 source: tests/mcp_server.rs
-assertion_line: 29
+assertion_line: 30
 expression: summary
 ---
 - description: "Returns the processes inside a given cgroup. Takes a cgroup_path in normalized form (relative to /sys/fs/cgroup, no leading slash, empty string for the root cgroup) and returns each process with comm, cmdline, state, ppid, and rss_bytes. Use this to drill into a cgroup identified via cgroup-mcp's tools. The cgroup_path from any cgroup-mcp output can be passed here verbatim; both servers use the same identifier convention. Results are sorted descending by rss_bytes, with null values (kernel threads with no userspace memory map) last. cmdline args matching *key*=*, *token*=*, *password*=*, *secret*=* are redacted by default; set redact_args=false to receive them verbatim. The `skipped` field counts PIDs encountered in /proc that could not be fully read (transient process death, permission denied). Non-zero means the snapshot may be incomplete."
@@ -80,6 +80,165 @@ expression: summary
       - results
       - skipped
     title: PidsInCgroupResponse
+    type: object
+- description: "Returns the full per-PID drill-down bundle for one process. Includes the same identifier fields as pids_in_cgroup (pid, comm, cmdline, state, ppid, rss_bytes, cgroup_path) plus uid, num_threads, fd_count, a smaps_rollup memory breakdown (Rss/Pss/Shared/Private/Anon/Swap), and IO counters. Use this after identifying a PID of interest via pids_in_cgroup or top_processes. The `memory.pss_bytes` field is the fairest single number for 'this process's memory cost' when pages are shared with other processes (browser tabs, JVM workers, etc.). Permission-gated fields are nullable when the kernel rejects the read: `fd_count` and `io` typically require ptrace capability or matching uid; `memory` is null for kernel threads. Cmdline args matching *key=*, *token=*, *password=*, *secret=* are redacted by default; pass `redact_args=false` to receive them verbatim. Errors if the PID does not exist."
+  input_schema:
+    $schema: "https://json-schema.org/draft/2020-12/schema"
+    properties:
+      pid:
+        description: "PID of the process to drill into. Must currently exist in\n`/proc/<pid>/`."
+        format: uint32
+        minimum: 0
+        type: integer
+      redact_args:
+        default: ~
+        description: "If true (the default), command-line arguments whose key matches\n`*key*=*`, `*token*=*`, `*password*=*`, `*secret*=*`\n(case-insensitive) are replaced with `key=REDACTED`."
+        type:
+          - boolean
+          - "null"
+    required:
+      - pid
+    title: ProcessInfoParams
+    type: object
+  name: process_info
+  output_schema:
+    $defs:
+      IoCounters:
+        description: "IO counters from `/proc/<pid>/io`. Cumulative since process start.\nReading this file typically requires ptrace capability or matching\nuid; non-root callers commonly hit EACCES."
+        properties:
+          read_bytes:
+            description: "Bytes read from disk (after the page cache). Matches kernel\n`read_bytes`."
+            format: uint64
+            minimum: 0
+            type: integer
+          read_syscalls:
+            description: "Number of read syscalls. Matches kernel `syscr`."
+            format: uint64
+            minimum: 0
+            type: integer
+          write_bytes:
+            description: "Bytes written to disk. Matches kernel `write_bytes`."
+            format: uint64
+            minimum: 0
+            type: integer
+          write_syscalls:
+            description: "Number of write syscalls. Matches kernel `syscw`."
+            format: uint64
+            minimum: 0
+            type: integer
+        required:
+          - read_bytes
+          - write_bytes
+          - read_syscalls
+          - write_syscalls
+        type: object
+      MemoryBreakdown:
+        description: "Memory breakdown from `/proc/<pid>/smaps_rollup`. All values in bytes."
+        properties:
+          anon_bytes:
+            description: "Anonymous (non-file-backed) memory: heap, stacks, malloc'd regions."
+            format: uint64
+            minimum: 0
+            type: integer
+          private_bytes:
+            description: "`Private_Clean + Private_Dirty`: pages mapped only by this process."
+            format: uint64
+            minimum: 0
+            type: integer
+          pss_bytes:
+            description: "Proportional set size: each shared page is counted in proportion to\nthe number of processes mapping it. The fairest single number for\n\"this process's memory cost\" when pages are shared across processes\n(browser tabs, JVM workers, etc.)."
+            format: uint64
+            minimum: 0
+            type: integer
+          rss_bytes:
+            description: "Resident set size: physical memory currently mapped to this process."
+            format: uint64
+            minimum: 0
+            type: integer
+          shared_bytes:
+            description: "`Shared_Clean + Shared_Dirty`: pages mapped by multiple processes."
+            format: uint64
+            minimum: 0
+            type: integer
+          swap_bytes:
+            description: Swapped-out pages.
+            format: uint64
+            minimum: 0
+            type: integer
+        required:
+          - rss_bytes
+          - pss_bytes
+          - shared_bytes
+          - private_bytes
+          - anon_bytes
+          - swap_bytes
+        type: object
+    $schema: "https://json-schema.org/draft/2020-12/schema"
+    properties:
+      cgroup_path:
+        description: "Normalized cgroup path. Same convention as cgroup-mcp: relative to\n`/sys/fs/cgroup`, no leading slash, empty string for the root."
+        type: string
+      cmdline:
+        description: "Space-joined cmdline from `/proc/<pid>/cmdline`. Empty for kernel\nthreads. Subject to the redaction flag the tool was called with."
+        type: string
+      comm:
+        description: "15-character kernel name from `/proc/<pid>/comm`."
+        type: string
+      fd_count:
+        description: "Count of entries in `/proc/<pid>/fd/`. Null if the directory was\nunreadable due to permissions (common for non-root callers)."
+        format: uint32
+        minimum: 0
+        type:
+          - integer
+          - "null"
+      io:
+        anyOf:
+          - $ref: "#/$defs/IoCounters"
+          - type: "null"
+        description: "Cumulative IO counters from `/proc/<pid>/io`. Null when the file\nis unreadable (EACCES is very common as non-root)."
+      memory:
+        anyOf:
+          - $ref: "#/$defs/MemoryBreakdown"
+          - type: "null"
+        description: "Memory breakdown from `/proc/<pid>/smaps_rollup`. Null for kernel\nthreads (no userspace memory map) or when EACCES."
+      num_threads:
+        description: Number of threads in the process group.
+        format: uint32
+        minimum: 0
+        type: integer
+      pid:
+        format: uint32
+        minimum: 0
+        type: integer
+      ppid:
+        format: uint32
+        minimum: 0
+        type: integer
+      rss_bytes:
+        description: "Resident set size in bytes. Null for kernel threads, which have\nno userspace memory map."
+        format: uint64
+        minimum: 0
+        type:
+          - integer
+          - "null"
+      state:
+        description: "Single-character state code from `/proc/<pid>/status`:\n`R`unning, `S`leeping, `D`isk-wait, `Z`ombie, `T`raced/stopped,\n`I`dle (kernel threads). Returned as a string for JSON portability."
+        type: string
+      uid:
+        description: Real uid that owns the process.
+        format: uint32
+        minimum: 0
+        type: integer
+    required:
+      - pid
+      - comm
+      - cmdline
+      - state
+      - ppid
+      - cgroup_path
+      - uid
+      - num_threads
+    title: ProcessInfoResponse
     type: object
 - description: "Returns the top N processes ranked by resident memory (rss_bytes), descending. Use this to answer 'what's using the most memory on this box.' Pass `cgroup_prefix` to scope the search to a cgroup subtree. The match is path-aware: `system.slice` matches `system.slice` itself and any descendant (e.g. `system.slice/nginx.service`), but NOT siblings like `system.slice2`. Take cgroup paths verbatim from any cgroup-mcp tool output. Results are returned with the same shape as `pids_in_cgroup`: pid, comm, cmdline (redacted by default; pass `redact_args=false` for verbatim), state, ppid, rss_bytes, and cgroup_path. Kernel threads (null rss_bytes) sort last. Default n is 10. CPU-based ranking is planned but not yet implemented; current sort is memory only."
   input_schema:
