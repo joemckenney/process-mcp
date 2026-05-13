@@ -21,6 +21,15 @@
 # making release-plz think the crate is non-releasable.
 publish = false
 
+# Use git tags as the version baseline instead of querying crates.io.
+# Without this, `publish = false` still leaves release-plz checking the
+# cargo registry for the "latest" version. A crate that was never
+# published returns "not found," and release-plz then treats current
+# Cargo.toml as the latest tagged release, so feat:/fix: commits since
+# the actual git tag don't trigger a bump proposal. `git_only = true`
+# makes release-plz use git tags as the version reference instead.
+git_only = true
+
 # Create the v* git tag when the release PR is merged.
 git_tag_enable = true
 
