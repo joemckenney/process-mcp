@@ -10,7 +10,7 @@ The motivating case: cgroup-level state tells you "this 2.2 GB scope is the heav
 
 ## Status
 
-Early. Two tools shipped. See [PLAN.md](./PLAN.md) for the full design document and tool roadmap.
+Early. Three tools shipped. See [PLAN.md](./PLAN.md) for the full design document and tool roadmap.
 
 ## Planned tools
 
@@ -20,11 +20,11 @@ Shipped:
 
 - `pids_in_cgroup`: given a cgroup path, list the processes inside it with `comm`, `cmdline` (redacted by default), `state`, `ppid`, `rss_bytes`
 - `top_processes`: rank processes system-wide by memory, with an optional `cgroup_prefix` filter for path-aware subtree scoping
+- `process_info`: full per-PID drill-down (uid, num_threads, fd_count, smaps_rollup memory breakdown, IO counters)
 
 Next up:
 
 - `top_processes(sort="cpu")`: CPU rate sampling, same blocking pattern as cgroup-mcp's `top_cpu`
-- `process_info`: full per-PID drill-down bundle, peer of cgroup-mcp's `get_unit_stats`
 - `process_tree`: parent/child forest under a root PID or cgroup (phase 2)
 
 ## Installation
@@ -66,6 +66,10 @@ This is the bridge tool between process-mcp and [cgroup-mcp](https://github.com/
 ### top_processes
 
 Returns the top N processes system-wide, ranked by `rss_bytes` descending. Default `n` is 10. Same entry shape as `pids_in_cgroup`. Pass `cgroup_prefix` to scope the search to a cgroup subtree; matching is path-aware so `system.slice` matches the slice itself and any descendant but never siblings like `system.slice2`. The same `redact_args` policy applies. Sort is by memory only for now; CPU rate sampling is planned but not yet implemented.
+
+### process_info
+
+Single-PID drill-down. Returns the same identifier fields as the other tools (`pid`, `comm`, `cmdline`, `state`, `ppid`, `rss_bytes`, `cgroup_path`) plus `uid`, `num_threads`, `fd_count`, a memory breakdown from `smaps_rollup` (`rss_bytes`, `pss_bytes`, `shared_bytes`, `private_bytes`, `anon_bytes`, `swap_bytes`), and cumulative IO counters (`read_bytes`, `write_bytes`, `read_syscalls`, `write_syscalls`). Use after identifying a PID via `pids_in_cgroup` or `top_processes`. `pss_bytes` is the fairest single number for "this process's memory cost" when pages are shared across processes (browser tabs, JVM workers). `fd_count`, `memory`, and `io` are null when permission-gated reads fail (common for non-root callers and across user namespaces). Errors if the PID does not exist.
 
 ## Tests
 
