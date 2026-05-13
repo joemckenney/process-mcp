@@ -1,48 +1,91 @@
 # process-mcp
 
-A read-only MCP server that exposes per-process Linux state from `/proc/<pid>/*` as structured tool calls for AI agents.
-
-## What it does
-
-Per-process drill-down for AI agents. Given a PID or a cgroup path, return what a process is doing: command line, resident memory, file descriptors, parent/child relationships, CPU and IO activity. Sister project to [cgroup-mcp](https://github.com/joemckenney/cgroup-mcp), which answers "which cgroups" while this one answers "which processes." The two compose through cgroup paths: every process entry from process-mcp carries a `cgroup_path` field normalized identically to cgroup-mcp's identifiers, so an agent can take any output from one and feed it into the other.
-
-The motivating case: cgroup-level state tells you "this 2.2 GB scope is the heaviest" but stops at leaf scopes. process-mcp drills in and says "and inside that scope, these are the processes."
-
-## Status
-
-Early. Three tools shipped. See [PLAN.md](./PLAN.md) for the full design document and tool roadmap.
-
-## Planned tools
-
-Driven by [PLAN.md](./PLAN.md), sequenced by dogfooding feedback.
-
-Shipped:
-
-- `pids_in_cgroup`: given a cgroup path, list the processes inside it with `comm`, `cmdline` (redacted by default), `state`, `ppid`, `rss_bytes`
-- `top_processes`: rank processes system-wide by memory, with an optional `cgroup_prefix` filter for path-aware subtree scoping
-- `process_info`: full per-PID drill-down (uid, num_threads, fd_count, smaps_rollup memory breakdown, IO counters)
-
-Next up:
-
-- `top_processes(sort="cpu")`: CPU rate sampling, same blocking pattern as cgroup-mcp's `top_cpu`
-- `process_tree`: parent/child forest under a root PID or cgroup (phase 2)
+A read-only MCP server exposing per-process Linux state (`/proc/<pid>/*`) as structured tools for AI agents.
 
 ## Installation
-
-Once the first release ships, install via:
 
 ```sh
 curl -sSf https://raw.githubusercontent.com/joemckenney/process-mcp/main/install.sh | sh
 ```
 
-Linux only. Pre-built binaries for `x86_64` and `aarch64`. Until v0.1.0 lands, build from source (see below).
+Linux only. Pre-built binaries for `x86_64` and `aarch64`.
+
+## Setup
+
+Add the MCP server to Claude Code:
+
+```sh
+claude mcp add --transport stdio --scope user process -- process-mcp
+```
+
+The proc root defaults to `/proc`. Override with `--proc-root <path>` if needed (useful for testing against captured trees).
+
+## Usage
+
+Sister project to [cgroup-mcp](https://github.com/joemckenney/cgroup-mcp): cgroup-mcp answers "which cgroups," process-mcp answers "which processes." The two compose through cgroup paths. Both tools use the same normalized identifier (relative to `/sys/fs/cgroup`, no leading slash, empty string for the root), so any cgroup path from one server can be passed verbatim to the other.
+
+The motivating case: cgroup-level state tells you "this 2.2 GB scope is the heaviest" but stops at leaf scopes. process-mcp drills in.
+
+```
+> What's holding the 2 GB inside session-1.scope?
+```
+
+Claude calls `pids_in_cgroup("user.slice/user-1000.slice/session-1.scope")`, gets back the processes inside, and ranks them by RSS. Each entry carries the cgroup path so further drilling stays composable.
+
+```
+> What's using the most memory under user.slice?
+```
+
+Claude calls `top_processes(cgroup_prefix="user.slice")`, gets a system-wide ranking scoped to that subtree. Path-aware matching keeps `user.slice2` out of the results.
+
+```
+> Tell me everything about PID 4815.
+```
+
+Claude calls `process_info(pid=4815)` for the full drill-down: cmdline, fd count, smaps_rollup memory breakdown (RSS, PSS, shared, private, anon, swap), cumulative IO counters, parent PID, thread count, uid, cgroup path. `pss_bytes` in particular is the fairest single number for "this process's memory cost" when pages are shared across processes (browser tabs, JVM workers).
+
+## Tools
+
+| Tool             | Purpose                                                                       |
+| ---------------- | ----------------------------------------------------------------------------- |
+| `pids_in_cgroup` | Processes inside a given cgroup, sorted by RSS                                |
+| `top_processes`  | Top N processes by RSS system-wide, optionally scoped to a cgroup subtree     |
+| `process_info`   | Full per-PID drill-down (memory breakdown, fd count, IO counters, uid)        |
+
+Cmdline arguments matching `*key=*`, `*token=*`, `*password=*`, `*secret=*` (case-insensitive) are redacted by default to avoid leaking secrets passed on the command line. Pass `redact_args=false` to receive them verbatim. Permission-gated fields (`fd_count`, `memory`, `io` on `process_info`) are null when the kernel rejects the read; this is common when running as non-root or across user namespaces.
 
 ## Requirements
 
 - Linux with a procfs mount at `/proc`. Default on every distro.
-- Rust toolchain if building from source.
+- Kernel 4.20 or newer for `smaps_rollup` (required by `process_info`'s memory breakdown).
 
 Does not run on macOS, Windows, or BSD. `/proc` formats are Linux-specific.
+
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                            process-mcp                              │
+│                                                                     │
+│  ┌─────────────┐   parse    ┌──────────────┐   wrap   ┌──────────┐  │
+│  │  /proc/     │──────────▶ │  Collector   │────────▶ │   MCP    │  │
+│  │  <pid>/*    │   typed    │  (pure fns)  │  tools   │  Server  │  │
+│  └─────────────┘   structs  └──────────────┘          └────┬─────┘  │
+│                                                            │ stdio  │
+└────────────────────────────────────────────────────────────┼────────┘
+                                                             │
+                                                             ▼
+                                                      ┌─────────────┐
+                                                      │   Claude    │
+                                                      │    Code     │
+                                                      └─────────────┘
+```
+
+Three layers: a pure-function collector that reads `/proc/<pid>/*` and returns typed Rust structs, a thin MCP wrapper that exposes collector output as tools, and stdio transport. Each tool call is a point-in-time snapshot.
+
+Per-process listings walk `/proc` and filter by `cgroup_path`. PIDs that vanish or are unreadable mid-walk are counted into a `skipped` field rather than failing the whole call, so a busy box with churning processes still gets a useful snapshot.
+
+Read-only by design. No write paths, no signal-sending, no priority changes.
 
 ## Building from Source
 
@@ -53,42 +96,14 @@ cargo build --release
 # binary at ./target/release/process-mcp
 ```
 
-The proc root defaults to `/proc`. Override with `--proc-root <path>` if needed (useful for testing against captured fixtures).
-
-## Tools
-
-### pids_in_cgroup
-
-Takes a cgroup path in process-mcp's normalized form (relative to `/sys/fs/cgroup`, no leading slash, empty string for the root cgroup) and returns the processes inside it. Each entry carries `pid`, `comm`, `cmdline`, `state`, `ppid`, `rss_bytes`, and `cgroup_path`. Results are sorted by `rss_bytes` descending with `null` (kernel threads) last. Cmdline args matching `*key=*`, `*token=*`, `*password=*`, `*secret=*` are redacted by default; pass `redact_args=false` to receive them verbatim. A `skipped` count surfaces PIDs that vanished or were unreadable mid-walk so the agent knows when the snapshot may be incomplete.
-
-This is the bridge tool between process-mcp and [cgroup-mcp](https://github.com/joemckenney/cgroup-mcp): take a cgroup path from any cgroup-mcp result and pass it here verbatim. Both servers use the same identifier convention.
-
-### top_processes
-
-Returns the top N processes system-wide, ranked by `rss_bytes` descending. Default `n` is 10. Same entry shape as `pids_in_cgroup`. Pass `cgroup_prefix` to scope the search to a cgroup subtree; matching is path-aware so `system.slice` matches the slice itself and any descendant but never siblings like `system.slice2`. The same `redact_args` policy applies. Sort is by memory only for now; CPU rate sampling is planned but not yet implemented.
-
-### process_info
-
-Single-PID drill-down. Returns the same identifier fields as the other tools (`pid`, `comm`, `cmdline`, `state`, `ppid`, `rss_bytes`, `cgroup_path`) plus `uid`, `num_threads`, `fd_count`, a memory breakdown from `smaps_rollup` (`rss_bytes`, `pss_bytes`, `shared_bytes`, `private_bytes`, `anon_bytes`, `swap_bytes`), and cumulative IO counters (`read_bytes`, `write_bytes`, `read_syscalls`, `write_syscalls`). Use after identifying a PID via `pids_in_cgroup` or `top_processes`. `pss_bytes` is the fairest single number for "this process's memory cost" when pages are shared across processes (browser tabs, JVM workers). `fd_count`, `memory`, and `io` are null when permission-gated reads fail (common for non-root callers and across user namespaces). Errors if the PID does not exist.
-
 ## Tests
 
 ```sh
 cargo test
 ```
 
-The crate ships with a `tool_list_snapshot` test that locks the public tool surface against drift. Tool descriptions are how the LLM picks tools, so the snapshot is intentionally noisy on change.
+Unit tests cover every parser (smaps_rollup, status, io, cgroup link, cmdline redaction). Integration tests use a synthetic `/proc` tempdir helper so the suite is hermetic and deterministic. A `tool_list_snapshot` test locks the public tool surface (names, descriptions, JSON schemas) against drift since tool descriptions are how the LLM picks tools.
 
 ## Releases
 
-Driven by [release-plz](https://release-plz.dev) reading [conventional commits](https://www.conventionalcommits.org/). On push to `main`, the workflow inspects commits since the last `v*` tag. If any imply a version bump (`feat:` for minor, `fix:` for patch, `feat!:` or `BREAKING CHANGE:` for major; pre-1.0, breaking changes bump minor), it opens a `chore: release vX.Y.Z` PR with version + changelog. Merging that PR tags the commit and triggers the binary workflow, which builds `x86_64` and `aarch64` tarballs via `cross` and uploads them to the GitHub Release.
-
-This repo does not publish to crates.io. Releases are GitHub Releases only.
-
-## Design notes
-
-Three-layer architecture matching cgroup-mcp: a pure-function collector that reads `/proc/<pid>/*` and returns typed Rust structs, a thin MCP wrapper that exposes collector output as tools, and stdio transport. The collector has no MCP dependency and could be reused as a library.
-
-Read-only by intent. No write paths, no signal-sending, no priority changes. Mixing read and write is the failure mode that bites every system tool.
-
-Snapshot, not stream. Each tool call is a point-in-time read. For time-series, the agent takes multiple snapshots and reasons about deltas.
+Driven by [release-plz](https://release-plz.dev) reading [conventional commits](https://www.conventionalcommits.org/). On push to `main`, the workflow inspects commits since the last `v*` tag. If any imply a version bump (`feat:` minor, `fix:` patch, `feat!:` or `BREAKING CHANGE:` major; pre-1.0, breaking changes bump minor), it opens a `chore: release vX.Y.Z` PR. Merging that PR tags the commit and triggers the binary workflow, which builds `x86_64` and `aarch64` tarballs via `cross` and uploads them to the GitHub Release. This repo does not publish to crates.io.
